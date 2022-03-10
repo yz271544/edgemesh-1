@@ -2,11 +2,9 @@ package tcp
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chassis/go-chassis/core/handler"
@@ -15,7 +13,8 @@ import (
 
 	"github.com/kubeedge/edgemesh/agent/pkg/chassis/config"
 	"github.com/kubeedge/edgemesh/agent/pkg/tunnel"
-	"github.com/kubeedge/edgemesh/common/constants"
+	"github.com/kubeedge/edgemesh/agent/pkg/tunnel/proxy"
+	"github.com/kubeedge/edgemesh/common/util"
 )
 
 const (
@@ -58,7 +57,7 @@ func (h *L4ProxyHandler) Handle(chain *handler.Chain, i *invocation.Invocation, 
 	}
 	klog.Infof("l4 proxy get tcpserver address: %v", i.Endpoint)
 
-	if targetNodeName == config.Chassis.Protocol.NodeName {
+	if targetNodeName == "" || targetNodeName == config.Chassis.Protocol.NodeName {
 		addr := &net.TCPAddr{
 			IP:   net.ParseIP(targetIP),
 			Port: int(targetPort),
@@ -88,9 +87,7 @@ func (h *L4ProxyHandler) Handle(chain *handler.Chain, i *invocation.Invocation, 
 
 		klog.Infof("l4 proxy start proxy data between tcpserver %s", addr.String())
 
-		closeOnce := &sync.Once{}
-		go pipe(lconn, rconn, closeOnce)
-		pipe(rconn, lconn, closeOnce)
+		go util.ProxyConn(rconn, lconn)
 
 		klog.Infof("Success proxy to %v", i.Endpoint)
 		err = cb(r)
@@ -98,16 +95,28 @@ func (h *L4ProxyHandler) Handle(chain *handler.Chain, i *invocation.Invocation, 
 			klog.Warningf("Callback err: %v", err)
 		}
 	} else {
-		stream, err := tunnel.Agent.TCPProxySvc.GetProxyStream(targetNodeName, targetIP, int32(targetPort))
+		proxyOpts := proxy.ProxyOptions{
+			Protocol: "tcp",
+			NodeName: targetNodeName,
+			IP:       targetIP,
+			Port:     int32(targetPort),
+		}
+		stream, err := tunnel.Agent.ProxySvc.GetProxyStream(proxyOpts)
 		if err != nil {
 			r.Err = fmt.Errorf("l4 proxy get proxy stream from %s error: %v", targetNodeName, err)
 			return
 		}
 		klog.Infof("l4 proxy start proxy data between tcpserver %v", i.Endpoint)
 
-		closeOnce := &sync.Once{}
-		go pipe(lconn, stream, closeOnce)
-		pipe(stream, lconn, closeOnce)
+		if tcpProtocol.UpgradeReq != nil {
+			_, err = stream.Write(tcpProtocol.UpgradeReq)
+			if err != nil {
+				r.Err = fmt.Errorf("tcp write req err: %v", err)
+				return
+			}
+		}
+
+		go util.ProxyConn(stream, lconn)
 
 		klog.Infof("Success proxy to %v", i.Endpoint)
 		err = cb(r)
@@ -115,17 +124,6 @@ func (h *L4ProxyHandler) Handle(chain *handler.Chain, i *invocation.Invocation, 
 			klog.Warningf("Callback err: %v", err)
 		}
 	}
-}
-
-func pipe(dst io.WriteCloser, src io.ReadCloser, closeOnce *sync.Once) {
-	_, err := io.Copy(dst, src)
-	if err != nil && err != io.EOF && !strings.Contains(err.Error(), constants.ConnectionClosed) && !strings.Contains(err.Error(), constants.StreamReset) {
-		klog.Errorf("io copy between proxy and client error: %v", err)
-	}
-	closeOnce.Do(func() {
-		dst.Close()
-		src.Close()
-	})
 }
 
 func newL4ProxyHandler() handler.Handler {

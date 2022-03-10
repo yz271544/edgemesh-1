@@ -7,13 +7,15 @@ import (
 	"github.com/libp2p/go-libp2p"
 	circuit "github.com/libp2p/go-libp2p-circuit"
 	"github.com/libp2p/go-libp2p-core/host"
+	libp2ptlsca "github.com/libp2p/go-libp2p-tls"
 	ma "github.com/multiformats/go-multiaddr"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/beehive/pkg/core"
-	"github.com/kubeedge/edgemesh/common/acl"
 	"github.com/kubeedge/edgemesh/common/informers"
 	"github.com/kubeedge/edgemesh/common/modules"
+	"github.com/kubeedge/edgemesh/common/security"
+	"github.com/kubeedge/edgemesh/common/util"
 	"github.com/kubeedge/edgemesh/server/pkg/tunnel/config"
 	"github.com/kubeedge/edgemesh/server/pkg/tunnel/controller"
 )
@@ -29,43 +31,65 @@ func newTunnelServer(c *config.TunnelServerConfig, ifm *informers.Manager) (serv
 	if !c.Enable {
 		return server, nil
 	}
+	server.Config.NodeName = util.FetchNodeName()
 
 	controller.Init(ifm)
 
-	privateKey, err := acl.GetPrivateKey(c.TunnelACLConfig)
+	aclManager := security.NewManager(c.Security)
+
+	aclManager.Start()
+
+	privateKey, err := aclManager.GetPrivateKey()
 	if err != nil {
-		return server, err
+		return server, fmt.Errorf("failed to get private key: %w", err)
 	}
 
-	var externalMultiAddr ma.Multiaddr
-	if c.PublicIP != "" {
-		externalMultiAddr, err = ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", c.PublicIP, c.ListenPort))
-		if err != nil {
-			klog.Warningf("New multiaddr err: %v", err)
-		}
-	}
 	addressFactory := func(addrs []ma.Multiaddr) []ma.Multiaddr {
-		if externalMultiAddr != nil {
-			addrs = append(addrs, externalMultiAddr)
+		for _, advertiseAddress := range c.AdvertiseAddress {
+			multiAddr, err := ma.NewMultiaddr(util.GenerateMultiAddr(c.Transport, advertiseAddress, c.ListenPort))
+			if err != nil {
+				klog.Warningf("New multiaddr err: %v", err)
+			}
+			// if the multiAddr is existed already, just skip
+			existed := false
+			for _, addr := range addrs {
+				if string(addr.Bytes()) == string(multiAddr.Bytes()) {
+					existed = true
+					break
+				}
+			}
+			if !existed {
+				addrs = append(addrs, multiAddr)
+			}
 		}
 		return addrs
 	}
 
-	host, err := libp2p.New(
-		context.Background(),
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", c.ListenPort)),
+	opts := []libp2p.Option{
+		libp2p.ListenAddrStrings(util.GenerateMultiAddr(c.Transport, "0.0.0.0", c.ListenPort)),
+		util.GenerateTransportOption(c.Transport),
 		libp2p.AddrsFactory(addressFactory),
 		libp2p.EnableRelay(circuit.OptHop),
 		libp2p.ForceReachabilityPrivate(),
 		libp2p.Identity(privateKey),
-	)
-	if err != nil {
-		errMsg := fmt.Errorf("Start tunnel server failed, %v", err)
-		klog.Errorln(errMsg)
-		return server, errMsg
 	}
-	server.Host = host
 
+	if c.Security.Enable {
+		if err := libp2ptlsca.EnableCAEncryption(c.Security.TLSCAFile, c.Security.TLSCertFile,
+			c.Security.TLSPrivateKeyFile); err != nil {
+			return nil, fmt.Errorf("go-libp2p-tls: enable ca encryption err: %w", err)
+		}
+		opts = append(opts, libp2p.Security(libp2ptlsca.ID, libp2ptlsca.New))
+	} else {
+		opts = append(opts, libp2p.NoSecurity)
+	}
+
+	h, err := libp2p.New(context.Background(), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start tunnel server: %w", err)
+	}
+
+	server.Host = h
 	return server, err
 }
 
@@ -73,7 +97,7 @@ func newTunnelServer(c *config.TunnelServerConfig, ifm *informers.Manager) (serv
 func Register(c *config.TunnelServerConfig, ifm *informers.Manager) error {
 	server, err := newTunnelServer(c, ifm)
 	if err != nil {
-		return fmt.Errorf("register module tunnelserver error: %v", err)
+		return fmt.Errorf("failed to register module tunnelserver: %w", err)
 	}
 	core.Register(server)
 	return nil

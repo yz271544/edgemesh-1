@@ -20,6 +20,7 @@ import (
 	"github.com/kubeedge/edgemesh/agent/pkg/proxy"
 	"github.com/kubeedge/edgemesh/agent/pkg/tunnel"
 	"github.com/kubeedge/edgemesh/common/informers"
+	commonutil "github.com/kubeedge/edgemesh/common/util"
 	"github.com/kubeedge/kubeedge/pkg/util"
 	"github.com/kubeedge/kubeedge/pkg/util/flag"
 	"github.com/kubeedge/kubeedge/pkg/version"
@@ -39,21 +40,21 @@ for the inter-communications between services at edge scenarios.`,
 			flag.PrintFlags(cmd.Flags())
 
 			if errs := opts.Validate(); len(errs) > 0 {
-				klog.Fatal(util.SpliceErrors(errs))
+				klog.Exit(util.SpliceErrors(errs))
 			}
 
 			agentCfg, err := opts.Config()
 			if err != nil {
-				klog.Fatal(err)
+				klog.Exit(err)
 			}
 
 			if errs := validation.ValidateEdgeMeshAgentConfiguration(agentCfg); len(errs) > 0 {
-				klog.Fatal(util.SpliceErrors(errs.ToAggregate().Errors()))
+				klog.Exit(util.SpliceErrors(errs.ToAggregate().Errors()))
 			}
 
 			klog.Infof("Version: %+v", version.Get())
 			if err = Run(agentCfg); err != nil {
-				klog.Fatalf("run edgemesh-agent failed: %v", err)
+				klog.Exit("run edgemesh-agent failed: ", err)
 			}
 		},
 	}
@@ -92,19 +93,25 @@ func Run(cfg *config.EdgeMeshAgentConfig) error {
 	}
 	trace++
 
+	klog.Infof("[%d] Prepare agent to run", trace)
+	if err = prepareRun(cfg); err != nil {
+		return err
+	}
+	klog.Infof("edgemesh-agent running on %s", cfg.CommonConfig.Mode)
+	trace++
+
+	// NOTE: we only install go-chassis when the gateway module enabled.
+	if cfg.Modules.EdgeGatewayConfig.Enable {
+		klog.Infof("[%d] Install go-chassis plugins", trace)
+		chassis.Install(cfg.GoChassisConfig, ifm)
+		trace++
+	}
+
 	klog.Infof("[%d] Register beehive modules", trace)
 	if errs := registerModules(cfg, ifm); len(errs) > 0 {
 		return fmt.Errorf(util.SpliceErrors(errs))
 	}
 	trace++
-
-	// As long as either the proxy module or the gateway module is enabled,
-	// the go-chassis plugins must also be install.
-	if cfg.Modules.EdgeProxyConfig.Enable || cfg.Modules.EdgeGatewayConfig.Enable {
-		klog.Infof("[%d] Install go-chassis plugins", trace)
-		chassis.Install(cfg.GoChassisConfig, ifm)
-		trace++
-	}
 
 	klog.Infof("[%d] Start informers manager", trace)
 	ifm.Start(wait.NeverStop)
@@ -142,4 +149,30 @@ func registerModules(c *config.EdgeMeshAgentConfig, ifm *informers.Manager) []er
 		errs = append(errs, err)
 	}
 	return errs
+}
+
+// prepareRun prepares edgemesh-agent to run
+func prepareRun(c *config.EdgeMeshAgentConfig) error {
+	// if the user sets KubeConfig or Master and Master is not equal to EdgeApiServer, enter the debug mode
+	if c.KubeAPIConfig.KubeConfig != "" || c.KubeAPIConfig.Master != "" &&
+		c.KubeAPIConfig.Master != config.DefaultEdgeApiServer {
+		c.CommonConfig.Mode = config.DebugMode
+	}
+
+	// set dns and proxy modules listenInterface
+	if c.Modules.EdgeDNSConfig.Enable || c.Modules.EdgeProxyConfig.Enable {
+		if err := commonutil.CreateEdgeMeshDevice(c.CommonConfig.DummyDeviceName, c.CommonConfig.DummyDeviceIP); err != nil {
+			return fmt.Errorf("failed to create edgemesh device %s: %w", c.CommonConfig.DummyDeviceName, err)
+		}
+		c.Modules.EdgeDNSConfig.ListenInterface = c.CommonConfig.DummyDeviceName
+		c.Modules.EdgeProxyConfig.ListenInterface = c.CommonConfig.DummyDeviceName
+	}
+
+	// set dns module mode
+	if c.Modules.EdgeDNSConfig.Enable {
+		c.Modules.EdgeDNSConfig.Mode = c.CommonConfig.Mode
+		c.Modules.EdgeDNSConfig.KubeAPIConfig = c.KubeAPIConfig
+	}
+
+	return nil
 }

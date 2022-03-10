@@ -13,12 +13,19 @@
 # limitations under the License.
 
 GOPATH?=$(shell go env GOPATH)
+IMAGE_REPO ?= kubeedge
+ARCH ?= amd64
+IMAGE_TAG ?= $(shell git describe --tags)
+GO_LDFLAGS='$(shell hack/make-rules/version.sh)'
 
 # make all builds both agent and server binaries
 
 BINARIES=edgemesh-agent \
          edgemesh-server
 
+# the env PLATFORMS defines to generate linux images for amd 64-bit, arm 64-bit and armv7 architectures
+# the full list of PLATFORMS is linux/amd64,linux/arm64,linux/arm/v7
+PLATFORMS ?= linux/amd64,linux/arm64
 COMPONENTS=agent \
            server
 
@@ -54,6 +61,14 @@ all: verify-golang
 	EDGEMESH_OUTPUT_SUBPATH=$(OUT_DIR) hack/make-rules/build.sh $(WHAT)
 endif
 
+.PHONY: docker-cross-build
+ifeq ($(HELP),y)
+docker-cross-build:
+	@echo "docker cross build for $${COMPONENTS} in platform $${PLATFORMS}"
+else
+docker-cross-build:
+	hack/make-rules/cross-build.sh
+endif
 
 define VERIFY_HELP_INFO
 # verify golang,vendor
@@ -133,12 +148,37 @@ clean:
 endif
 
 
-ARCH ?= amd64
-IMAGE_TAG ?= $(shell git describe --tags)
-GO_LDFLAGS='$(shell hack/make-rules/version.sh)'
+define LOADBALANCE_HELP_INFO
+# Load balance test.
+#
+# Example:
+#   make lb
+#   make lb HELP=y
+#
+endef
+.PHONY: lb
+ifeq ($(HELP),y)
+lb:
+	@echo "$$LOADBALANCE_HELP_INFO"
+else
+lb:
+	tests/loadbalance/execute.sh
+endif
+
 
 .PHONY: images agentimage serverimage
 images: agentimage serverimage
 agentimage serverimage:
 	docker build --build-arg GO_LDFLAGS=${GO_LDFLAGS} -t kubeedge/edgemesh-${@:image=}:${IMAGE_TAG} -f build/${@:image=}/Dockerfile .
 
+
+.PHONY: push push-all push-multi-platform-images
+push-all: push-multi-platform-images
+
+# push target pushes edgemesh-built images
+push: images
+	for target in $(COMPONENTS); do docker push ${IMAGE_REPO}/edgemesh-$$target:${IMAGE_TAG}; done
+
+# push multi-platform images
+push-multi-platform-images:
+	bash hack/make-rules/push.sh

@@ -5,8 +5,6 @@ import (
 
 	"github.com/kubeedge/beehive/pkg/core"
 	"github.com/kubeedge/edgemesh/agent/pkg/proxy/config"
-	"github.com/kubeedge/edgemesh/agent/pkg/proxy/controller"
-	"github.com/kubeedge/edgemesh/agent/pkg/proxy/protocol"
 	"github.com/kubeedge/edgemesh/common/informers"
 	"github.com/kubeedge/edgemesh/common/modules"
 	"github.com/kubeedge/edgemesh/common/util"
@@ -14,11 +12,9 @@ import (
 
 // EdgeProxy is used for traffic proxy
 type EdgeProxy struct {
-	Config   *config.EdgeProxyConfig
-	TCPProxy *protocol.TCPProxy
-	Proxier  *Proxier
-	// TODO(Poorunga) realize the proxy of UDP protocol
-	// UDPProxy *protocol.UDPProxy
+	Config      *config.EdgeProxyConfig
+	ProxyServer *ProxyServer
+	Socks5Proxy *Socks5Proxy
 }
 
 func newEdgeProxy(c *config.EdgeProxyConfig, ifm *informers.Manager) (proxy *EdgeProxy, err error) {
@@ -27,26 +23,24 @@ func newEdgeProxy(c *config.EdgeProxyConfig, ifm *informers.Manager) (proxy *Edg
 		return proxy, nil
 	}
 
-	// init proxy controller
-	controller.Init(ifm)
-
 	// get proxy listen ip
 	listenIP, err := util.GetInterfaceIP(proxy.Config.ListenInterface)
 	if err != nil {
 		return proxy, fmt.Errorf("get proxy listen ip err: %v", err)
 	}
 
-	// get tcp proxy
-	proxy.TCPProxy = &protocol.TCPProxy{Name: protocol.TCP}
-	if err := proxy.TCPProxy.SetListener(listenIP, proxy.Config.ListenPort); err != nil {
-		return proxy, fmt.Errorf("set tcp proxy err: %v", err)
+	// new proxy server
+	proxy.ProxyServer, err = newProxyServer(NewDefaultKubeProxyConfiguration(listenIP.String()), false, ifm.GetKubeClient(), ifm.GetIstioClient())
+	if err != nil {
+		return proxy, fmt.Errorf("new proxy server err: %v", err)
 	}
 
-	// new proxier
-	protoProxies := []protocol.ProtoProxy{proxy.TCPProxy}
-	proxy.Proxier, err = NewProxier(proxy.Config.SubNet, protoProxies, ifm.GetKubeClient())
-	if err != nil {
-		return proxy, fmt.Errorf("new proxier err: %v", err)
+	// new socks5 proxy
+	if proxy.Config.Socks5Proxy.Enable {
+		proxy.Socks5Proxy, err = NewSocks5Proxy(listenIP, proxy.Config.Socks5Proxy.ListenPort, proxy.Config.NodeName, ifm.GetKubeClient())
+		if err != nil {
+			return proxy, fmt.Errorf("new socks5Proxy err: %w", err)
+		}
 	}
 
 	return proxy, nil

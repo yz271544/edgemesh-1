@@ -19,7 +19,6 @@ package http
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,17 +27,20 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/go-chassis/go-chassis/core/common"
-	"github.com/go-chassis/go-chassis/core/handler"
 	"github.com/go-chassis/go-chassis/core/invocation"
 	apiv1alpha3 "istio.io/api/networking/v1alpha3"
 	istioapi "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/edgemesh/agent/pkg/chassis/controller"
-	"github.com/kubeedge/edgemesh/agent/pkg/chassis/loadbalancer/util"
+	"github.com/kubeedge/edgemesh/agent/pkg/chassis/protocol"
 	"github.com/kubeedge/edgemesh/agent/pkg/chassis/protocol/tcp"
 )
+
+func init() {
+	http := &HTTP{}
+	http.Register()
+}
 
 // HTTP http
 type HTTP struct {
@@ -51,23 +53,18 @@ type HTTP struct {
 	Resp           *http.Response
 }
 
+// register protocol name
+func (p *HTTP) Register() {
+	protocol.RegisterProtocols = append(protocol.RegisterProtocols, "http")
+}
+
 // Process process
 func (p *HTTP) Process() {
 	for {
 		// parse http request
 		req, err := http.ReadRequest(bufio.NewReader(p.Conn))
-		if err != nil {
-			if err == io.EOF {
-				klog.Warningf("read http request EOF")
-				err = p.Conn.Close()
-				if err != nil {
-					klog.Errorf("close conn err: %v", err)
-				}
-				return
-			}
-			klog.Errorf("read http request err: %v", err)
-			err = p.Conn.Close()
-			if err != nil {
+		if err != nil || err == io.EOF {
+			if err = p.Conn.Close(); err != nil {
 				klog.Errorf("close conn err: %v", err)
 			}
 			return
@@ -78,66 +75,31 @@ func (p *HTTP) Process() {
 			err = p.route(req.RequestURI)
 			if err != nil {
 				klog.Errorf("route by http request uri err: %v", err)
-				err = p.Conn.Close()
-				if err != nil {
+				if err = p.Conn.Close(); err != nil {
 					klog.Errorf("close conn err: %v", err)
 				}
 				return
 			}
 		}
 
-		// websocket
-		if upgradeWebsocket(req) {
-			klog.Infof("upgrade websocket")
-			reqBytes, err1 := httpRequestToBytes(req)
-			if err1 != nil {
-				klog.Errorf("req to bytes with err: %s", err1)
-				err1 = p.Conn.Close()
-				if err1 != nil {
-					klog.Errorf("close conn err: %v", err1)
-				}
-				return
-			}
-			websocket := &tcp.TCP{
-				Conn:         p.Conn,
-				SvcNamespace: p.SvcNamespace,
-				SvcName:      p.SvcName,
-				Port:         p.Port,
-				UpgradeReq:   reqBytes,
-			}
-			websocket.Process()
-			return
-		}
-
-		// http: Request.RequestURI can't be set in client requests, just reset it
-		req.RequestURI = ""
-
-		// create invocation
-		inv := invocation.New(context.Background())
-
-		// set invocation
-		inv.MicroServiceName = fmt.Sprintf("%s.%s.svc.cluster.local:%d", p.SvcName, p.SvcNamespace, p.Port)
-		inv.SourceServiceID = ""
-		inv.Protocol = "rest"
-
-		inv.Strategy = util.GetStrategyName(p.SvcNamespace, p.SvcName)
-		inv.Args = req
-		inv.Reply = &http.Response{}
-
-		// create handler chain
-		c, err := handler.CreateChain(common.Consumer, "http", handler.Loadbalance, handler.Transport)
+		// http fallback to tcp
+		reqBytes, err := httpRequestToBytes(req)
 		if err != nil {
-			klog.Errorf("create handler chain error: %v", err)
-			err = p.Conn.Close()
-			if err != nil {
+			klog.Errorf("transforms http request to bytes err: %v", err)
+			if err = p.Conn.Close(); err != nil {
 				klog.Errorf("close conn err: %v", err)
 			}
 			return
 		}
 
-		// start to handle
-		p.Req = req
-		c.Next(inv, p.responseCallback)
+		httpToTcp := &tcp.TCP{
+			Conn:         p.Conn,
+			SvcNamespace: p.SvcNamespace,
+			SvcName:      p.SvcName,
+			Port:         p.Port,
+			UpgradeReq:   reqBytes,
+		}
+		httpToTcp.Process()
 	}
 }
 
@@ -267,21 +229,4 @@ func httpRequestToBytes(req *http.Request) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-// upgradeWebsocket returns true if request is for websocket upgrade
-func upgradeWebsocket(req *http.Request) bool {
-	if req == nil {
-		return false
-	}
-	if req.Header == nil {
-		return false
-	}
-	if req.Header.Get("Connection") == "Upgrade" &&
-		req.Header.Get("Upgrade") == "websocket" &&
-		req.Header.Get("Sec-WebSocket-Version") != "" &&
-		req.Header.Get("Sec-WebSocket-Key") != "" {
-		return true
-	}
-	return false
 }

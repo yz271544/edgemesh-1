@@ -37,6 +37,9 @@ type Identity struct {
 
 // NewIdentity creates a new identity
 func NewIdentity(privKey ic.PrivKey) (*Identity, error) {
+	if caEnable {
+		return &Identity{config: *caConfig.tlsConfig.Clone()}, nil
+	}
 	cert, err := keyToCertificate(privKey)
 	if err != nil {
 		return nil, err
@@ -105,6 +108,9 @@ func (i *Identity) ConfigForPeer(remote peer.ID) (*tls.Config, <-chan ic.PubKey)
 func PubKeyFromCertChain(chain []*x509.Certificate) (ic.PubKey, error) {
 	if len(chain) != 1 {
 		return nil, errors.New("expected one certificates in the chain")
+	}
+	if caEnable {
+		return pubKeyFromCertChainAndTLSConfig(chain)
 	}
 	cert := chain[0]
 	pool := x509.NewCertPool()

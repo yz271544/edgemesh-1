@@ -1,26 +1,26 @@
-FROM golang:1.14-alpine3.11 AS builder
+FROM golang:1.17 AS builder
 
 ARG GO_LDFLAGS
-
-# set goproxy
-# using the go module
-RUN go env -w GO111MODULE=on
-# source
-RUN apk update && apk add gcc && \
-    apk --no-cache add build-base linux-headers sqlite-dev binutils-gold &&\
-    apk --no-cache add iptables
+ARG TARGETARCH
 
 WORKDIR /code
 COPY . .
 
-RUN CGO_ENABLED=1 go build -v -o /usr/local/bin/edgemesh-agent -ldflags "$GO_LDFLAGS -w -s" \
-./agent/cmd/edgemesh-agent/agent.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GO_LDFLAGS=$GO_LDFLAGS make WHAT=edgemesh-agent
 
 
 FROM alpine:3.11
 
-RUN apk update && apk --no-cache add iptables
+RUN apk update && apk --no-cache add iptables && apk --no-cache add dpkg
 
-COPY --from=builder /usr/local/bin/edgemesh-agent /usr/local/bin/edgemesh-agent
+COPY --from=builder /code/_output/local/bin/edgemesh-agent /usr/local/bin/edgemesh-agent
+
+# Add support for auto-detection of iptables mode
+COPY --from=builder /code/build/agent/iptables-wrapper /sbin/iptables-wrapper
+RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-legacy 50
+RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-nft 50
+RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-wrapper 100 \
+    --slave /sbin/iptables-restore iptables-restore /sbin/iptables-wrapper \
+    --slave /sbin/iptables-save iptables-save /sbin/iptables-wrapper
 
 ENTRYPOINT ["edgemesh-agent"]

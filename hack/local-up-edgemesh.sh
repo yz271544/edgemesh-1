@@ -43,10 +43,14 @@ IMAGE_TAG=localup
 
 CLUSTER_NAME=test
 MASTER_NODENAME=${CLUSTER_NAME}-control-plane
+HOST_IP=`hostname -I | awk '{print $1}'`
 EDGE_NODENAME=edge-node
+KUBEEDGE_VERSION=1.8.2
 NAMESPACE=kubeedge
 LOG_DIR=${LOG_DIR:-"/tmp"}
 TIMEOUT=${TIMEOUT:-120}s
+KUBEAPI_PROXY_PORT=8090
+KUBEAPI_PROXY_ADDR=""
 
 if [[ "${CLUSTER_NAME}x" == "x" ]];then
     CLUSTER_NAME="test"
@@ -64,22 +68,32 @@ get_kubeedge_pid() {
    awk -v bin="${1:-edgecore}" 'NF=$2==bin'
 }
 
-
 # spin up cluster with kind command
 function kind_up_cluster {
   echo "Running kind: [kind create cluster ${CLUSTER_CONTEXT} --image kindest/node:v1.18.2]"
-  kind create cluster ${CLUSTER_CONTEXT}  --image kindest/node:v1.18.2
+  kind create cluster ${CLUSTER_CONTEXT} --image kindest/node:v1.18.2
   add_cleanup '
     echo "Running kind: [kind delete cluster ${CLUSTER_CONTEXT}]"
     kind delete cluster ${CLUSTER_CONTEXT}
   '
 }
 
-
 function check_control_plane_ready {
   echo "wait the control-plane ready..."
   kubectl wait --for=condition=Ready node/${CLUSTER_NAME}-control-plane --timeout=${TIMEOUT}
   MASTER_IP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' test-control-plane`
+}
+
+function proxy_kube_apiserver {
+    set -x
+    echo "proxy kube-apiserver on master"
+    nohup kubectl proxy --address='0.0.0.0' --port=${KUBEAPI_PROXY_PORT} --accept-hosts='^*$' >/dev/null 2>&1 &
+    PROXY_PID=$!
+    add_cleanup 'sudo kill $PROXY_PID'
+    KUBEAPI_PROXY_ADDR=${HOST_IP}:${KUBEAPI_PROXY_PORT}
+    echo ${KUBEAPI_PROXY_ADDR}
+    sleep 5
+    curl ${KUBEAPI_PROXY_ADDR}
 }
 
 function check_node_ready {
@@ -92,7 +106,7 @@ localup_kubeedge() {
   # init cloudcore
   add_cleanup 'rm `ls /etc/kubeedge | grep -v "kubeedge"` -rf'
   add_cleanup 'sudo -E keadm reset --force --kube-config=${KUBECONFIG}'
-  sudo -E keadm init --advertise-address=127.0.0.1 --kubeedge-version=1.7.2 --kube-config=${KUBECONFIG}
+  sudo -E keadm init --advertise-address=${HOST_IP} --kubeedge-version=${KUBEEDGE_VERSION} --kube-config=${KUBECONFIG}
 
   # ensure tokensecret is generated
   for ((i=1;i<20;i++)) ; do
@@ -107,14 +121,15 @@ localup_kubeedge() {
   token=$(sudo keadm gettoken --kube-config=${KUBECONFIG})
   echo $token
 
-  # turn off edgemesh and turn on list-watch featuren and resart edgeocre
+  # turn off edgemesh and turn on local apiserver featuren and resart edgeocre
   export CHECK_EDGECORE_ENVIRONMENT="false"
-  sudo -E keadm join --cloudcore-ipport=127.0.0.1:10000 --kubeedge-version=1.7.2 --token=${token} --edgenode-name=${EDGE_NODENAME}
+  sudo -E keadm join --cloudcore-ipport=${HOST_IP}:10000 --kubeedge-version=${KUBEEDGE_VERSION} --token=${token} --edgenode-name=${EDGE_NODENAME}
 
   EDGE_BIN=/usr/local/bin/edgecore
   EDGE_CONFIGFILE=/etc/kubeedge/config/edgecore.yaml
   EDGECORE_LOG=${LOG_DIR}/edgecore.log
-  sudo sed -i '$a\  edgeMesh:\n    enable: false\n'  ${EDGE_CONFIGFILE}
+  sudo sed -i 's/clusterDNS:\ \"\"/clusterDNS:\ 169.254.96.16/g' ${EDGE_CONFIGFILE}
+  sudo sed -i 's/clusterDomain:\ \"\"/clusterDomain:\ cluster.local/g' ${EDGE_CONFIGFILE}
 
   ps -aux | grep edgecore
 
@@ -136,12 +151,9 @@ build_component_image() {
   # no clean up for images
 }
 
-
 load_images_to_master() {
-  local image
-  for image in $SERVER_IMAGE; do
-    kind load --name $CLUSTER_NAME docker-image $image
-  done
+  kind load --name $CLUSTER_NAME docker-image $SERVER_IMAGE
+  kind load --name $CLUSTER_NAME docker-image $AGENT_IMAGE
 }
 
 prepare_k8s_env() {
@@ -152,287 +164,19 @@ prepare_k8s_env() {
 }
 
 start_edgemesh() {
-  start_edgemesh_server
+  echo "using helm to install edgemesh"
+  helm install edgemesh \
+    --set server.image=${SERVER_IMAGE} \
+    --set server.nodeName=${MASTER_NODENAME} \
+    --set agent.image=${AGENT_IMAGE} \
+    --set agent.kubeAPIConfig.master=${KUBEAPI_PROXY_ADDR} \
+    --set agent.modules.edgeDNS.cacheDNS.enable=true \
+    ./build/helm/edgemesh
 
-  start_edgemesh_agent
-}
-
-start_edgemesh_server() {
-  local edgemesh_server_deploy_name=edgemesh-server
-
-  add_cleanup "
-  kubectl delete --timeout=5s deployment edgemesh-server -n kubeedge
-  "
-  # create rbac
-  kubectl create -f- <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-server
-  name: edgemesh-server
-  namespace: kubeedge
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: edgemesh-server
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-server
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: edgemesh-server
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-server
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: edgemesh-server
-subjects:
-  - kind: ServiceAccount
-    name: edgemesh-server
-    namespace: kubeedge
-EOF
-
-  # create configmap
-  kubectl create -f- <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: edgemesh-server
-  namespace: kubeedge
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-server
-data:
-  edgemesh-server.yaml: |
-    modules:
-      tunnel:
-        enable: true
-        publicIP: ${MASTER_IP}
-EOF
-
-  # create deployment
-
-  kubectl create -f- <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-server
-  name: ${edgemesh_server_deploy_name}
-  namespace: kubeedge
-spec:
-  selector:
-    matchLabels:
-      k8s-app: kubeedge
-      kubeedge: edgemesh-server
-  template:
-    metadata:
-      labels:
-        k8s-app: kubeedge
-        kubeedge: edgemesh-server
-    spec:
-      hostNetwork: true
-      #use label to selector node
-      nodeName: ${MASTER_NODENAME}
-      containers:
-      - name: edgemesh-server
-        image: ${SERVER_IMAGE}
-        imagePullPolicy: IfNotPresent
-        env:
-          - name: MY_NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
-        ports:
-        - containerPort: 10004
-          name: relay
-          protocol: TCP
-        resources:
-          limits:
-            cpu: 200m
-            memory: 1Gi
-          requests:
-            cpu: 100m
-            memory: 512Mi
-        volumeMounts:
-          - name: conf
-            mountPath: /etc/kubeedge/config
-          - name: edgemesh
-            mountPath: /etc/kubeedge/edgemesh
-      restartPolicy: Always
-      serviceAccountName: edgemesh-server
-      volumes:
-        - name: conf
-          configMap:
-            name: edgemesh-server
-        - name: edgemesh
-          hostPath:
-            path: /etc/kubeedge/edgemesh
-            type: DirectoryOrCreate
-EOF
-
-echo "wait the edgemesh-server pod ready"
-kubectl wait --timeout=${TIMEOUT} --for=condition=Ready pod -l kubeedge=edgemesh-server -n kubeedge
-}
-
-start_edgemesh_agent() {
-  local edgemesh_ds_name=edgemesh-agent
-
-  add_cleanup "
-  kubectl delete --timeout=5s ds ${edgemesh_ds_name} -n kubeedge
-  "
-
-  # create configmap
-  kubectl create -f- <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: edgemesh-agent-cfg
-  namespace: kubeedge
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh
-data:
-  edgemesh-agent.yaml: |
-    apiVersion: agent.edgemesh.config.kubeedge.io/v1alpha1
-    kind: EdgeMeshAgent
-    kubeAPIConfig:
-      burst: 200
-      contentType: application/json
-      kubeConfig: "/etc/kubeedge/kubeconfig"
-      master: ""
-      qps: 100
-    goChassisConfig:
-      protocol:
-        tcpBufferSize: 8192
-        tcpClientTimeout: 5
-        tcpReconnectTimes: 3
-      loadBalancer:
-        defaultLBStrategy: RoundRobin
-        supportLBStrategies:
-          - RoundRobin
-          - Random
-          - ConsistentHash
-        consistentHash:
-          partitionCount: 100
-          replicationFactor: 10
-          load: 1.25
-    modules:
-      edgeDNS:
-        enable: true
-        listenInterface: docker0
-        listenPort: 53
-      edgeProxy:
-        enable: true
-        subNet: 10.96.0.0/12
-        listenInterface: docker0
-        listenPort: 40001
-      edgeGateway:
-        enable: false
-        nic: "*"
-        includeIP: "*"
-        excludeIP: "*"
-      tunnel:
-        enable: true
-        listenPort: 10006
-EOF
-
-  sleep 5
-
-  # start edgemesh-agent as daemonset
-  kubectl create -f- <<EOF
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: ${edgemesh_ds_name}
-  namespace: kubeedge
-  labels:
-    k8s-app: kubeedge
-    kubeedge: edgemesh-agent
-spec:
-  selector:
-    matchLabels:
-      k8s-app: kubeedge
-      kubeedge: edgemesh-agent
-  template:
-    metadata:
-      labels:
-        k8s-app: kubeedge
-        kubeedge: edgemesh-agent
-    spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: node-role.kubernetes.io/edge
-                    operator: Exists
-                  - key: node-role.kubernetes.io/agent
-                    operator: Exists
-      hostNetwork: true
-      containers:
-        - name: edgemesh-agent
-          securityContext:
-            privileged: true
-          image: ${AGENT_IMAGE}
-          imagePullPolicy: IfNotPresent
-          env:
-            - name: MY_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          resources:
-            limits:
-              cpu: 200m
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              memory: 128Mi
-          volumeMounts:
-            - name: conf
-              mountPath: /etc/kubeedge/config
-            - name: resolv
-              mountPath: /etc/resolv.conf
-            - name: edgemesh
-              mountPath: /etc/kubeedge/edgemesh
-            - name: kubeconfig
-              mountPath: /etc/kubeedge/kubeconfig
-      volumes:
-        - name: conf
-          configMap:
-            name: edgemesh-agent-cfg
-        - name: resolv
-          hostPath:
-            path: /etc/resolv.conf
-        - name: edgemesh
-          hostPath:
-            path: /etc/kubeedge/edgemesh
-            type: DirectoryOrCreate
-        - name: kubeconfig
-          hostPath:
-            path: ${KUBECONFIG}
-EOF
-  sleep 15
-  kubectl get pod -n kubeedge -o wide
-  echo "wait the edgemesh pod ready"
+  kubectl wait --timeout=${TIMEOUT} --for=condition=Ready pod -l kubeedge=edgemesh-server -n kubeedge
   kubectl wait --timeout=${TIMEOUT} --for=condition=Ready pod -l kubeedge=edgemesh-agent -n kubeedge
 
-  # print edgemesh iptables rules
-  sudo iptables-save | grep EDGE-MESH
-
-  add_debug_info "See edgemesh status: kubectl get ds -n $NAMESPACE $edgemesh_ds_name"
+  add_debug_info "See edgemesh status: kubectl get pod -n $NAMESPACE"
 }
 
 declare -a CLEANUP_CMDS=()
@@ -493,10 +237,8 @@ label_node() {
 }
 
 create_istio_crd() {
-  echo "createing the istio crd..."
-  kubectl apply -f ${EDGEMESH_ROOT}/build/crds/istio/destinationrule-crd.yaml
-  kubectl apply -f ${EDGEMESH_ROOT}/build/crds/istio/gateway-crd.yaml
-  kubectl apply -f ${EDGEMESH_ROOT}/build/crds/istio/virtualservice-crd.yaml
+  echo "creating the istio crds..."
+  kubectl apply -f ${EDGEMESH_ROOT}/build/crds/istio/
 }
 
 do_up() {
@@ -511,8 +253,9 @@ do_up() {
 
   check_control_plane_ready
 
-  kubectl delete daemonset kindnet -n kube-system
   kubectl create ns kubeedge
+
+  proxy_kube_apiserver
 
   # here local up kubeedge before building our images, this could avoid our
   # images be removed since edgecore image gc would be triggered when high
@@ -533,7 +276,6 @@ do_up() {
 }
 
 do_up_fg() {
-
   do_up
 
   echo "Local cluster is $(green_text running).
@@ -546,7 +288,6 @@ do_up_fg() {
 }
 
 main() {
-
   if [ "${ENABLE_DAEMON}" = false ]; then
     trap cleanup EXIT
     trap clean ERR
@@ -556,7 +297,6 @@ main() {
     trap clean INT
     do_up
   fi
-
 }
 
 main

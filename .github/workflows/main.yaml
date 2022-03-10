@@ -7,6 +7,9 @@ on:
     tags:
   pull_request:
 
+env:
+  KUBEEDGE_VERSION: v1.8.2
+
 jobs:
   verify-and-lint:
     runs-on: ubuntu-latest
@@ -18,7 +21,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.14.x
+          go-version: 1.17.x
 
       - name: Checkout code
         uses: actions/checkout@v2
@@ -50,7 +53,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.14.x
+          go-version: 1.17.x
 
       - uses: actions/cache@v2
         with:
@@ -74,12 +77,17 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.14.x
+          go-version: 1.17.x
 
       - uses: actions/cache@v2
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.4.0
 
       - name: Install dependences
         run: |
@@ -87,10 +95,10 @@ jobs:
           go get sigs.k8s.io/kind@v0.11.1
           curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.19.3/bin/linux/amd64/kubectl && sudo install kubectl /usr/local/bin/kubectl
           type keadm || {
-            curl -LO https://github.com/kubeedge/kubeedge/releases/download/v1.7.2/keadm-v1.7.2-linux-amd64.tar.gz
-            tar -C . -xzf keadm-v1.7.2-linux-amd64.tar.gz
-            chmod +x ./keadm-v1.7.2-linux-amd64/keadm/keadm
-            sudo mv ./keadm-v1.7.2-linux-amd64/keadm/keadm /usr/local/bin/keadm
+            curl -LO https://github.com/kubeedge/kubeedge/releases/download/$KUBEEDGE_VERSION/keadm-$KUBEEDGE_VERSION-linux-amd64.tar.gz
+            tar -C . -xzf keadm-$KUBEEDGE_VERSION-linux-amd64.tar.gz
+            chmod +x ./keadm-$KUBEEDGE_VERSION-linux-amd64/keadm/keadm
+            sudo mv ./keadm-$KUBEEDGE_VERSION-linux-amd64/keadm/keadm /usr/local/bin/keadm
           }
       - name: Checkout code
         uses: actions/checkout@v2
@@ -107,7 +115,7 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.14.x
+          go-version: 1.17.x
 
       - uses: actions/cache@v2
         with:
@@ -119,4 +127,48 @@ jobs:
         with:
           fetch-depth: 0
 
-      - run: make agentimage
+      - run: make images
+
+  docker_cross_build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: Docker cross build images
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.17.x
+
+      - uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - run: make docker-cross-build
+
+  check-helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.4.0
+
+      - name: Check helm package
+        run: |
+          chmod a+x hack/verify-helm-package.sh && hack/verify-helm-package.sh

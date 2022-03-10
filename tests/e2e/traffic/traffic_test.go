@@ -8,7 +8,6 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/kubeedge/edgemesh/tests/e2e/k8s"
 	"github.com/kubeedge/kubeedge/tests/e2e/constants"
@@ -16,7 +15,7 @@ import (
 )
 
 const (
-	retryTime    = 20
+	retryTime    = 3
 	intervalTime = 5 * time.Second
 )
 
@@ -40,21 +39,16 @@ var _ = Describe("Traffic", func() {
 			testTimer.End()
 			// Print result
 			testTimer.PrintResult()
-			var podlist corev1.PodList
 			var deploymentList appsv1.DeploymentList
 			err := utils.GetDeployments(&deploymentList, ctx.Cfg.K8SMasterForKubeEdge+constants.DeploymentHandler)
 			Expect(err).To(BeNil())
 			for _, deployment := range deploymentList.Items {
 				if deployment.Name == UID {
-					labels := deployment.Spec.Selector.MatchLabels
-					podlist, err = k8s.GetPodByLabels(labels, ctx)
-					Expect(err).To(BeNil())
 					err := k8s.CleanupApplication(UID, ctx)
 					Expect(err).To(BeNil())
+					break
 				}
 			}
-			utils.Infof("podlist len %v", len(podlist.Items))
-			utils.CheckPodDeleteState(ctx.Cfg.K8SMasterForKubeEdge+constants.AppHandler, podlist)
 			utils.PrintTestcaseNameandStatus()
 		})
 
@@ -73,10 +67,10 @@ var _ = Describe("Traffic", func() {
 			Expect(err).To(BeNil())
 			clusterIP := service.Spec.ClusterIP
 
-			// 3. use busybox pod exec dig <hostname-svc>.<namespace>
-			// use sys.call docker exec -it <busybox-id> dig hostname-svc.default A +noall +answer +tries=10
-			// s := "docker exec 980f466def1d dig hostname-svc.default"
-			domain := k8s.GenServiceNameFromUID(UID) + "." + defaultNamespace
+			// 3. use busybox pod exec dig <hostname-svc>.<namespace>.svc.cluster.local.
+			// use sys.call docker exec -it <busybox-id> dig hostname-svc.default.svc.cluster.local. A +noall +answer +tries=5
+			// s := "docker exec 980f466def1d dig hostname-svc.default.svc.cluster.local."
+			domain := k8s.GenServiceNameFromUID(UID) + "." + defaultNamespace + ".svc.cluster.local."
 			command := fmt.Sprintf("docker exec -i %s dig %s A +noall +answer +tries=5", busyboxToolContainerID, domain)
 			utils.Infof("command %v", command)
 			var outStr, resultIP string

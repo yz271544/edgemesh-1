@@ -2,7 +2,6 @@ package registry
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -12,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/edgemesh/agent/pkg/chassis/controller"
+	"github.com/kubeedge/edgemesh/agent/pkg/chassis/protocol"
 	"github.com/kubeedge/edgemesh/common/util"
 )
 
@@ -19,20 +19,6 @@ const (
 	// EdgeRegistry constants string
 	EdgeRegistry = "edge"
 )
-
-type instanceList []*registry.MicroServiceInstance
-
-func (I instanceList) Len() int {
-	return len(I)
-}
-
-func (I instanceList) Less(i, j int) bool {
-	return strings.Compare(I[i].InstanceID, I[j].InstanceID) < 0
-}
-
-func (I instanceList) Swap(i, j int) {
-	I[i], I[j] = I[j], I[i]
-}
 
 // init initialize the service discovery of edge meta registry
 func init() {
@@ -57,7 +43,7 @@ func (esd *EdgeServiceDiscovery) GetAllMicroServices() ([]*registry.MicroService
 
 // FindMicroServiceInstances find micro-service instances (subnets)
 func (esd *EdgeServiceDiscovery) FindMicroServiceInstances(consumerID, microServiceName string, tags utiltags.Tags) ([]*registry.MicroServiceInstance, error) {
-	var microServiceInstances instanceList
+	var microServiceInstances []*registry.MicroServiceInstance
 
 	// parse microServiceName
 	name, namespace, svcPort, err := parseServiceURL(microServiceName)
@@ -96,32 +82,27 @@ func (esd *EdgeServiceDiscovery) FindMicroServiceInstances(consumerID, microServ
 	}
 
 	// gen MicroServiceInstances
+	var nodeName string
+	var instanceName string
 	for _, subset := range eps.Subsets {
-		if len(subset.Ports) > 0 && subset.Ports[0].Port == int32(targetPort) {
-			for _, addr := range subset.Addresses {
-				if addr.NodeName == nil {
-					// Each backend(Address) must have a nodeName, so we do not support custom Endpoints now.
-					// This means that external services cannot be used.
-					continue
-				}
-				microServiceInstances = append(microServiceInstances, &registry.MicroServiceInstance{
-					InstanceID:   fmt.Sprintf("%s.%s|%s.%d", namespace, name, addr.IP, targetPort),
-					ServiceID:    fmt.Sprintf("%s#%s#%s", namespace, name, addr.IP),
-					HostName:     "",
-					EndpointsMap: map[string]string{proto: fmt.Sprintf("%s:%s:%d", *addr.NodeName, addr.IP, targetPort)},
-				})
+		for _, addr := range subset.Addresses {
+			if addr.NodeName != nil {
+				nodeName = *addr.NodeName
+			} else {
+				nodeName = ""
 			}
+			if addr.TargetRef != nil {
+				instanceName = addr.TargetRef.Name
+			} else {
+				instanceName = addr.IP
+			}
+			microServiceInstances = append(microServiceInstances, &registry.MicroServiceInstance{
+				InstanceID:   fmt.Sprintf("%s.%s|%s:%s:%d", namespace, name, nodeName, addr.IP, targetPort),
+				ServiceID:    fmt.Sprintf("%s#%s#%s", namespace, name, instanceName),
+				EndpointsMap: map[string]string{proto: fmt.Sprintf("%s:%s:%d", nodeName, addr.IP, targetPort)},
+			})
 		}
 	}
-
-	// no instances found
-	if len(microServiceInstances) == 0 {
-		return nil, fmt.Errorf("service %s.%s has no instances", namespace, name)
-	}
-
-	// Why do we need to sort microServiceInstances?
-	// That's because the pod list obtained by the PodLister is out of order.
-	sort.Sort(microServiceInstances)
 
 	return microServiceInstances, nil
 }
@@ -171,13 +152,20 @@ func parseServiceURL(serviceURL string) (string, string, int, error) {
 }
 
 // getPortAndProtocol get targetPort and protocol, targetPort is equal to containerPort
-func getPortAndProtocol(svc *v1.Service, svcPort int) (targetPort int, protocol string) {
+func getPortAndProtocol(svc *v1.Service, svcPort int) (targetPort int, protocolName string) {
 	for _, p := range svc.Spec.Ports {
 		if p.Protocol == "TCP" && int(p.Port) == svcPort {
-			protocol = strings.Split(p.Name, "-")[0]
+			protocolName = "tcp"
+			pro := strings.Split(p.Name, "-")[0]
+			for _, p := range protocol.RegisterProtocols {
+				if p == pro {
+					protocolName = pro
+					break
+				}
+			}
 			targetPort = p.TargetPort.IntValue()
 			break
 		}
 	}
-	return targetPort, protocol
+	return targetPort, protocolName
 }

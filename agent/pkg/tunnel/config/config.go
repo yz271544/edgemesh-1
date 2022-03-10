@@ -1,40 +1,44 @@
 package config
 
 import (
-	"os"
-
-	"k8s.io/klog/v2"
-
-	"github.com/kubeedge/edgemesh/common/acl"
 	meshConstants "github.com/kubeedge/edgemesh/common/constants"
+	"github.com/kubeedge/edgemesh/common/security"
+)
+
+const (
+	defaultListenPort = 20006
 )
 
 type TunnelAgentConfig struct {
 	// Enable indicates whether TunnelAgent is enabled,
 	// if set to false (for debugging etc.), skip checking other TunnelAgent configs.
-	// default true
-	Enable bool `json:"enable"`
-	// TunnelACLConfig indicates the set of tunnel agent config about acl
-	acl.TunnelACLConfig
+	// default false
+	Enable bool `json:"enable,omitempty"`
+	// Security indicates the set of tunnel agent config about security
+	Security *security.Security `json:"security,omitempty"`
 	// NodeName indicates the node name of tunnel agent
-	NodeName string `json:"nodeName"`
+	NodeName string `json:"nodeName,omitempty"`
 	// ListenPort indicates the listen port of tunnel agent
-	// default 10006
-	ListenPort int `json:"listenPort"`
+	// default 20006
+	ListenPort int `json:"listenPort,omitempty"`
+	// EnableHolePunch indicates whether p2p hole punching feature is enabled,
+	// default true
+	EnableHolePunch bool `json:"enableHolePunch,omitempty"`
+	// Transport indicates the transport protocol used by the p2p tunnel
+	Transport string `json:"transport,omitempty"`
 }
 
 func NewTunnelAgentConfig() *TunnelAgentConfig {
-	nodeName, isExist := os.LookupEnv(meshConstants.MY_NODE_NAME)
-	if !isExist {
-		klog.Fatalf("env %s not exist", meshConstants.MY_NODE_NAME)
-	}
-
 	return &TunnelAgentConfig{
-		Enable: true,
-		TunnelACLConfig: acl.TunnelACLConfig{
+		Enable: false,
+		Security: &security.Security{
+			Enable:            false,
 			TLSPrivateKeyFile: meshConstants.AgentDefaultKeyFile,
+			TLSCAFile:         meshConstants.AgentDefaultCAFile,
+			TLSCertFile:       meshConstants.AgentDefaultCertFile,
 		},
-		NodeName:   nodeName,
-		ListenPort: 10006,
+		ListenPort:      defaultListenPort,
+		EnableHolePunch: true,
+		Transport:       "tcp",
 	}
 }
